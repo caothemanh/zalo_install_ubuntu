@@ -53,7 +53,7 @@ zalo-backup update <link raw install.sh>
 
 ## Gỡ
 ```bash
-curl -fsSL https://raw.githubusercontent.com/USER/REPO/main/install.sh | sudo bash -s uninstall
+curl -fsSL https://raw.githubusercontent.com/caothemanh/zalo_install_ubuntu/main/install.sh | sudo bash -s uninstall
 ```
 
 > Dùng API không chính thức (zca-js), có rủi ro bị khóa tài khoản. Nên thử bằng nick phụ.
