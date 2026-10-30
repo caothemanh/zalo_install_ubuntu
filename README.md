@@ -1,24 +1,20 @@
-# Zalo Web 24/7 on VPS via Docker
+# Zalo Backup Bot
 
-Giải pháp chạy Zalo Web liên tục 24/7 trên VPS Ubuntu/Debian thông qua Docker Chrome WebGUI, hỗ trợ tự động sao lưu dữ liệu và tin nhắn hàng ngày.
+Đăng nhập Zalo bằng QR trên web, tự sao lưu tin nhắn đến/đi vào `/opt/zalo-backup/backup/`.
 
-## 🚀 Tính năng chính
-- Running Chrome WebGUI trên Docker container.
-- Tự động duy trì đăng nhập Zalo Web 24/7.
-- Tự động cài đặt Docker và cấu hình môi trường.
-- Tích hợp Cronjob sao lưu (backup) profile Zalo Web mỗi ngày lúc 02:00 AM.
-- Tự động dọn dẹp các bản backup cũ quá 7 ngày.
-
-## 🛠 Hướng dẫn sử dụng
-
-Chạy duy nhất **1 lệnh** sau trên VPS Ubuntu/Debian của bạn:
+## Cài đặt (Ubuntu, 1 lệnh)
 
 ```bash
-bash <(curl -sSL https://raw.githubusercontent.com/<username>/<repo-name>/main/install.sh)
+curl -fsSL https://raw.githubusercontent.com/caothemanh/zalo_install_ubuntu/main/install.sh | sudo bash
 ```
-*(Thay `<username>` và `<repo-name>` bằng tài khoản GitHub & tên Repository của bạn)*
 
-## 📂 Structure Repository
+Cổng khác: `curl -fsSL ... | sudo PORT=8080 bash`
 
-- `install.sh`: Script cài đặt chính.
-- `README.md`: Tài liệu hướng dẫn sử dụng.
+Script sẽ in ra URL + user/password. Mở URL, quét QR bằng Zalo.
+
+## Gỡ
+```bash
+curl -fsSL https://raw.githubusercontent.com/USER/REPO/main/install.sh | sudo bash -s uninstall
+```
+
+> Dùng API không chính thức (zca-js), có rủi ro bị khóa tài khoản. Nên thử bằng nick phụ.

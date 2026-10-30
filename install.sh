@@ -1,101 +1,170 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Zalo Backup Bot - cài đặt 1 lệnh trên Ubuntu
+# Dùng:   curl -fsSL https://raw.githubusercontent.com/USER/REPO/main/install.sh | sudo bash
+# Gỡ:     curl -fsSL .../install.sh | sudo bash -s uninstall
+set -euo pipefail
 
-# ==========================================
-# AUTO INSTALL ZALO WEB ON VPS VIA DOCKER
-# ==========================================
+APP_DIR=/opt/zalo-backup
+SERVICE=zalo-backup
+PORT="${PORT:-3000}"
 
-# Màu sắc thông báo
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+[ "$(id -u)" -eq 0 ] || { echo "Chạy bằng root: sudo bash install.sh"; exit 1; }
 
-echo -e "${GREEN}===============================================${NC}"
-echo -e "${GREEN}   Bắt đầu cài đặt Zalo Web 24/7 trên VPS     ${NC}"
-echo -e "${GREEN}===============================================${NC}"
-
-# 1. Cập nhật hệ thống
-echo -e "${YELLOW}[1/5] Cập nhật danh sách gói hệ thống...${NC}"
-sudo apt update -y
-
-# 2. Kiểm tra và Cài đặt Docker
-if ! command -v docker &> /dev/null; then
-    echo -e "${YELLOW}[2/5] Chưa phát hiện Docker. Đang tiến hành cài đặt Docker...${NC}"
-    curl -fsSL https://get.docker.com -o get-docker.sh
-    sudo sh get-docker.sh
-    rm get-docker.sh
-else
-    echo -e "${GREEN}[2/5] Docker đã được cài đặt sẵn.${NC}"
+if [ "${1:-}" = "uninstall" ]; then
+  systemctl disable --now $SERVICE 2>/dev/null || true
+  rm -f /etc/systemd/system/$SERVICE.service
+  systemctl daemon-reload
+  echo "Đã gỡ service. Dữ liệu vẫn còn ở $APP_DIR (xóa tay nếu không cần)."
+  exit 0
 fi
 
-# 3. Tạo thư mục dữ liệu
-echo -e "${YELLOW}[3/5] Khởi tạo thư mục lưu trữ dữ liệu Zalo...${NC}"
-DATA_DIR="$HOME/zalo-data"
-BACKUP_DIR="$HOME/zalo-backups"
-
-mkdir -p "$DATA_DIR/profile"
-mkdir -p "$DATA_DIR/downloads"
-mkdir -p "$BACKUP_DIR"
-
-# 4. Nhập mật khẩu VNC & Port
-echo -e "${GREEN}-----------------------------------------------${NC}"
-read -p "Nhập mật khẩu truy cập WebGUI (mặc định: zalo123456): " VNC_PW
-VNC_PW=${VNC_PW:-zalo123456}
-
-read -p "Nhập Cổng (Port) truy cập WebGUI (mặc định: 6901): " PORT
-PORT=${PORT:-6901}
-
-# Dừng container cũ nếu tồn tại
-if [ $(docker ps -aq -f name=zalo-web) ]; then
-    echo -e "${YELLOW}Đang dừng và xóa container zalo-web cũ...${NC}"
-    docker stop zalo-web >/dev/null 2>&1
-    docker rm zalo-web >/dev/null 2>&1
+echo ">> Cài Node.js..."
+NODE_MAJOR=0
+command -v node >/dev/null && NODE_MAJOR=$(node -p "process.versions.node.split('.')[0]")
+if [ "$NODE_MAJOR" -lt 18 ]; then
+  apt-get update -y
+  apt-get install -y curl ca-certificates
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  apt-get install -y nodejs
 fi
 
-# Chạy Docker Container
-echo -e "${YELLOW}[4/5] Đang khởi chạy Docker Container Zalo Web...${NC}"
-docker run -d \
-  --name zalo-web \
-  --restart unless-stopped \
-  -p ${PORT}:6901 \
-  -e VNC_PW="${VNC_PW}" \
-  -v "${DATA_DIR}/profile":/home/kasm-user/.config/google-chrome \
-  -v "${DATA_DIR}/downloads":/home/kasm-user/Downloads \
-  --shm-size=2g \
-  kasmweb/chrome:1.14.0
+echo ">> Tạo $APP_DIR..."
+mkdir -p $APP_DIR/backup
+cd $APP_DIR
 
-# 5. Cấu hình tự động Sao lưu (Backup Cronjob)
-echo -e "${YELLOW}[5/5] Thiết lập Cronjob tự động backup dữ liệu vào 02:00 sáng...${NC}"
-BACKUP_SCRIPT="$HOME/backup_zalo.sh"
+cat > package.json <<'PKG'
+{
+  "name": "zalo-backup",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "server.js",
+  "dependencies": { "zca-js": "latest", "express": "^4" }
+}
+PKG
 
-cat << 'EOF' > "$BACKUP_SCRIPT"
-#!/bin/bash
-BACKUP_DIR="$HOME/zalo-backups"
-DATA_DIR="$HOME/zalo-data"
-DATE=$(date +%Y-%m-%d_%H%M%S)
+cat > server.js <<'JS'
+import { Zalo, LoginQRCallbackEventType } from "zca-js";
+import express from "express";
+import fs from "fs";
+import path from "path";
 
-mkdir -p "$BACKUP_DIR"
-tar -czf "$BACKUP_DIR/zalo_session_$DATE.tar.gz" -C "$DATA_DIR" profile
-find "$BACKUP_DIR" -type f -mtime +7 -name "*.tar.gz" -delete
-EOF
+const BACKUP_DIR = process.env.BACKUP_DIR || "./backup";
+const CRED = "./cred.json";
+const PORT = process.env.PORT || 3000;
+const AUTH_USER = process.env.AUTH_USER;
+const AUTH_PASS = process.env.AUTH_PASS;
+fs.mkdirSync(BACKUP_DIR, { recursive: true });
 
-chmod +x "$BACKUP_SCRIPT"
+let qrImage = null, status = "init";
 
-# Thêm Cronjob nếu chưa có
-(crontab -l 2>/dev/null | grep -v "$BACKUP_SCRIPT"; echo "0 2 * * * $BACKUP_SCRIPT") | crontab -
+// Web server chạy trước để quét QR
+const app = express();
+app.use((req, res, next) => {
+  const h = req.headers.authorization || "";
+  const dec = Buffer.from(h.slice(6), "base64").toString();
+  const i = dec.indexOf(":");
+  if (AUTH_USER && dec.slice(0, i) === AUTH_USER && dec.slice(i + 1) === AUTH_PASS) return next();
+  res.set("WWW-Authenticate", 'Basic realm="zalo"').status(401).end();
+});
+app.get("/", (_, res) => res.send(
+  `<meta name=viewport content="width=device-width"><meta http-equiv=refresh content=3>` +
+  `<h3>Trạng thái: ${status}</h3>` +
+  (qrImage ? `<img src="${qrImage.startsWith("data:") ? qrImage : "data:image/png;base64," + qrImage}">` : "")));
+app.listen(PORT, () => console.log("Web: http://IP:" + PORT));
 
-# Lấy IP Public của VPS
-SERVER_IP=$(curl -s https://api.ipify.org || hostname -I | awk '{print $1}')
+const zalo = new Zalo({ selfListen: true });
 
-echo -e "${GREEN}===============================================${NC}"
-echo -e "${GREEN}         CÀI ĐẶT HOÀN TẤT THÀNH CÔNG!          ${NC}"
-echo -e "${GREEN}===============================================${NC}"
-echo -e "Truy cập giao diện Zalo Web tại:"
-echo -e "${YELLOW}👉 https://${SERVER_IP}:${PORT}${NC}"
-echo -e ""
-echo -e "Thông tin đăng nhập WebGUI:"
-echo -e "  - Username: ${GREEN}kasm_user${NC}"
-echo -e "  - Password: ${GREEN}${VNC_PW}${NC}"
-echo -e ""
-echo -e "Thư mục sao lưu tin nhắn/session: ${YELLOW}${BACKUP_DIR}${NC}"
-echo -e "${GREEN}===============================================${NC}"
+async function login() {
+  if (fs.existsSync(CRED)) {
+    try { return await zalo.login(JSON.parse(fs.readFileSync(CRED))); }
+    catch { console.log("Cred hết hạn, quét QR lại"); }
+  }
+  return await zalo.loginQR({}, (e) => {
+    switch (e.type) {
+      case LoginQRCallbackEventType.QRCodeGenerated:
+        qrImage = e.data.image; status = "Quét QR bằng app Zalo"; break;
+      case LoginQRCallbackEventType.QRCodeScanned:
+        status = "Đã quét: " + e.data.display_name + " - xác nhận trên điện thoại"; break;
+      case LoginQRCallbackEventType.QRCodeExpired:
+        e.actions.retry(); break;
+      case LoginQRCallbackEventType.GotLoginInfo:
+        fs.writeFileSync(CRED, JSON.stringify({
+          cookie: e.data.cookie, imei: e.data.imei, userAgent: e.data.userAgent
+        }), { mode: 0o600 }); break;
+    }
+  });
+}
+
+const api = await login();
+status = "Online - đang sao lưu"; qrImage = null;
+
+api.listener.on("message", (m) => {
+  const d = {
+    time: new Date().toISOString(),
+    threadId: m.threadId,
+    type: m.type,
+    isSelf: m.isSelf,
+    msgId: m.data.msgId,
+    from: m.data.uidFrom,
+    name: m.data.dName,
+    content: m.data.content,
+    ts: m.data.ts,
+  };
+  const dir = path.join(BACKUP_DIR, String(m.threadId));
+  fs.mkdirSync(dir, { recursive: true });
+  fs.appendFileSync(path.join(dir, d.time.slice(0, 10) + ".jsonl"), JSON.stringify(d) + "\n");
+});
+api.listener.on("closed", (code) => { console.log("closed", code); process.exit(1); });
+api.listener.on("error", (e) => console.error("listener error", e));
+api.listener.start();
+JS
+
+echo ">> npm install..."
+npm install --omit=dev --no-audit --no-fund
+
+# Tạo .env (giữ nguyên nếu đã có)
+if [ ! -f .env ]; then
+  PASS=$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  cat > .env <<ENV
+PORT=$PORT
+AUTH_USER=admin
+AUTH_PASS=$PASS
+ENV
+  chmod 600 .env
+  NEWPASS=1
+fi
+
+echo ">> Tạo systemd service..."
+cat > /etc/systemd/system/$SERVICE.service <<UNIT
+[Unit]
+Description=Zalo Backup Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=$APP_DIR
+EnvironmentFile=$APP_DIR/.env
+ExecStart=$(command -v node) server.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now $SERVICE
+[ -f cred.json ] && chmod 600 cred.json || true
+
+. ./.env
+IP=$(curl -fsS https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
+echo
+echo "=============================================="
+echo " Cài xong!"
+echo " Web:      http://$IP:$PORT"
+echo " User:     $AUTH_USER"
+echo " Password: $AUTH_PASS"
+echo " Tin nhắn: $APP_DIR/backup/<threadId>/<ngày>.jsonl"
+echo " Log:      journalctl -u $SERVICE -f"
+echo " Gỡ:       sudo bash install.sh uninstall"
+echo "=============================================="
