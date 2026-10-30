@@ -51,7 +51,7 @@ import https from "https";
 import { Readable } from "stream";
 import { pipeline } from "stream/promises";
 import {
-  BACKUP_DIR, allowed, loadNames, setName, markRecalled, notify, freeGB, maintenance, registerViewer,
+  BACKUP_DIR, allowed, loadNames, setName, markRecalled, notify, freeGB, maintenance, registerViewer, registerApi,
 } from "./lib.mjs";
 
 const CRED = "./cred.json";
@@ -78,6 +78,7 @@ app.use((req, res, next) => {
   res.set("WWW-Authenticate", 'Basic realm="zalo"').status(401).end();
 });
 registerViewer(app);
+registerApi(app, () => ({ status, qr: qrImage }));
 app.get("/", (_, res) => res.send(
   `<meta name=viewport content="width=device-width"><meta http-equiv=refresh content=3>` +
   `<h3>Trạng thái: ${status}</h3><p><a href="/view">Xem tin nhắn đã lưu</a></p>` +
@@ -383,22 +384,27 @@ export function maintenance({ mediaDays = 10, textDays = 0, compressDays = 0 } =
   return r;
 }
 
-// ---------- Telegram ----------
+// ---------- Cảnh báo: Telegram và/hoặc ntfy ----------
 export async function notify(text, key = "", cooldownMs = 0) {
-  const tok = process.env.TG_TOKEN, chat = process.env.TG_CHAT;
-  if (!tok || !chat) return false;
+  const tok = process.env.TG_TOKEN, chat = process.env.TG_CHAT, topic = process.env.NTFY_TOPIC;
+  const tg = tok && chat;
+  if (!tg && !topic) return false;
   if (key && cooldownMs) {
     const st = readJson(ALERTS_FILE, {});
     if (Date.now() - (st[key] || 0) < cooldownMs) return false;
     st[key] = Date.now(); try { writeJson(ALERTS_FILE, st); } catch {}
   }
-  try {
-    const r = await fetch(`https://api.telegram.org/bot${tok}/sendMessage`, {
-      method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: chat, text }), signal: AbortSignal.timeout(8000),
-    });
-    return r.ok;
-  } catch { return false; }
+  const jobs = [];
+  if (tg) jobs.push(fetch(`https://api.telegram.org/bot${tok}/sendMessage`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ chat_id: chat, text }), signal: AbortSignal.timeout(8000),
+  }));
+  if (topic) jobs.push(fetch(`${process.env.NTFY_SERVER || "https://ntfy.sh"}/${encodeURIComponent(topic)}`, {
+    method: "POST", headers: { Title: "Zalo Backup", Priority: "high" },
+    body: text, signal: AbortSignal.timeout(8000),
+  }));
+  const rs = await Promise.allSettled(jobs);
+  return rs.some((r) => r.status === "fulfilled" && r.value.ok);
 }
 
 // ---------- Render HTML (dùng cho web và export) ----------
@@ -486,6 +492,65 @@ ${i < days.length - 1 ? `<a href="?d=${days[i + 1]}">${days[i + 1]} ›</a>` : "
     res.set({ "Content-Security-Policy": "sandbox", "X-Content-Type-Options": "nosniff" });
     if (!inline) res.attachment(f);
     res.sendFile(p, { dotfiles: "deny" }, (err) => { if (err && !res.headersSent) res.status(404).end(); });
+  });
+}
+
+// ---------- JSON API cho app Android ----------
+export function registerApi(app, getState) {
+  const idOk = (s) => /^[\w-]+$/.test(String(s));
+  const nameOf = (id) => loadNames()[id]?.name || id;
+  const kind = (f) => /\.(jpe?g|png|gif|webp)$/i.test(f) ? "image" : /\.(aac|m4a|mp3|ogg|wav)$/i.test(f) ? "audio" : /\.(mp4|webm|mov)$/i.test(f) ? "video" : "file";
+  const apiMsg = (m, id, rec) => {
+    const ok = m.media && !/^(skipped|failed)/.test(m.media);
+    const f = ok ? path.basename(m.media) : null;
+    return {
+      id: String(m.msgId), ts: msgTime(m), time: fmtTime(m), name: m.name || m.from || "", self: !!m.isSelf,
+      text: msgText(m), recalled: rec.has(String(m.msgId)),
+      media: f ? { file: f, kind: kind(f), exists: fs.existsSync(path.join(BACKUP_DIR, id, "media", f)) } : m.media ? { note: String(m.media) } : null,
+    };
+  };
+
+  app.get("/api/status", (req, res) => {
+    const s = getState();
+    const qr = s.qr ? (String(s.qr).startsWith("data:") ? s.qr : "data:image/png;base64," + s.qr) : null;
+    res.json({ status: s.status, qr, threads: threadDirs().length });
+  });
+
+  app.get("/api/threads", (req, res) => {
+    const names = loadNames(), f = loadFilters();
+    const items = threadDirs().map((id) => {
+      const days = threadDays(id), last = days[days.length - 1] || "";
+      let preview = "", ts = 0;
+      if (last) {
+        const ms = readDay(id, last).filter((m) => !m.event), m = ms[ms.length - 1];
+        if (m) { preview = (m.isSelf ? "Tôi: " : "") + msgText(m).slice(0, 100); ts = msgTime(m); }
+      }
+      const off = f.only.length ? !f.only.includes(id) : f.ignore.includes(id);
+      return { id, name: names[id]?.name || id, type: names[id]?.type || "user", last, preview, ts, off };
+    }).sort((a, b) => b.ts - a.ts || b.last.localeCompare(a.last)).slice(0, 300);
+    res.json({ items });
+  });
+
+  app.get("/api/thread/:id/messages", (req, res) => {
+    const id = req.params.id;
+    if (!idOk(id)) return res.status(400).json({ error: "bad id" });
+    const days = threadDays(id);
+    if (!days.length) return res.status(404).json({ error: "not found" });
+    const q = String(req.query.d || ""), d = days.includes(q) ? q : days[days.length - 1];
+    const rec = recalledSet(id);
+    const messages = readDay(id, d).filter((m) => !m.event).sort((a, b) => msgTime(a) - msgTime(b)).slice(-3000).map((m) => apiMsg(m, id, rec));
+    res.json({ day: d, days: days.slice(-400), name: nameOf(id), messages });
+  });
+
+  app.get("/api/search", (req, res) => {
+    const q = String(req.query.q || "").trim();
+    if (!q) return res.json({ items: [] });
+    const limit = Math.min(Number(req.query.limit) || 100, 200);
+    const items = searchAll(q, { limit }).map(({ m, day }) => ({
+      threadId: String(m.threadId), thread: nameOf(String(m.threadId)), day, id: String(m.msgId),
+      time: fmtTime(m), name: m.name || "", self: !!m.isSelf, text: msgText(m).slice(0, 300),
+    }));
+    res.json({ items });
   });
 }
 LIB
@@ -628,16 +693,17 @@ case "${1:-help}" in
     echo "Tin hôm nay (UTC): $(cat $BK/*/$(date -u +%F).jsonl 2>/dev/null | wc -l)"
     echo "Media:     $(find $BK -path '*/media/*' -type f 2>/dev/null | wc -l) file, $(du -ch $BK/*/media 2>/dev/null | tail -1 | cut -f1)"
     echo "Giữ:       media $(getv MEDIA_DAYS) ngày, tin chữ $( [ "$(getv TEXT_DAYS)" = 0 ] && echo vĩnh viễn || echo "$(getv TEXT_DAYS) ngày"), nén sau $( [ "$(getv COMPRESS_DAYS)" = 0 ] && echo "(tắt)" || echo "$(getv COMPRESS_DAYS) ngày")"
-    echo "Telegram:  $( [ -n "$(getv TG_TOKEN)" ] && echo bật || echo tắt)"
+    echo "Cảnh báo:  Telegram $( [ -n "$(getv TG_TOKEN)" ] && echo bật || echo tắt), ntfy $( [ -n "$(getv NTFY_TOPIC)" ] && echo bật || echo tắt)"
     echo "Web xem tin: $(url)/view" ;;
-  info)    echo "Web: $(url)  (xem tin: $(url)/view)"; echo "User: $(getv AUTH_USER)"; echo "Pass: $(getv AUTH_PASS)" ;;
+  info)    echo "Web: $(url)  (xem tin: $(url)/view)"; echo "User: $(getv AUTH_USER)"; echo "Pass: $(getv AUTH_PASS)"
+    [ -n "$(getv TLS_CERT)" ] && echo "Vân tay chứng chỉ (SHA-256, dùng cho app Android): $(openssl x509 -in "$(getv TLS_CERT)" -noout -fingerprint -sha256 | cut -d= -f2)"; true ;;
   logs)    journalctl -u $SVC -n "${2:-50}" -f --no-pager ;;
   start|stop|restart) systemctl "$1" $SVC && echo "OK: $1" ;;
   logout)
     systemctl stop $SVC; rm -f $APP/cred.json; systemctl start $SVC
     echo "Đã xóa phiên đăng nhập. Mở $(url) để quét QR tài khoản mới."
     echo "(Muốn chắc chắn: vào Zalo > Cài đặt > Thiết bị đăng nhập, xóa thiết bị cũ.)" ;;
-  config)  sed -E 's/^(AUTH_PASS|TG_TOKEN)=.+/\1=******/' "$ENVF" ;;
+  config)  sed -E 's/^(AUTH_PASS|TG_TOKEN|NTFY_TOPIC)=.+/\1=******/' "$ENVF" ;;
   set)
     k="${2:-}"; v="${3:-}"
     case "$k" in MEDIA_DAYS|TEXT_DAYS|COMPRESS_DAYS|MAX_FILE_MB|MIN_FREE_GB|PORT|HOST|AUTH_USER|AUTH_PASS) ;;
@@ -690,14 +756,20 @@ case "${1:-help}" in
       rm -f /etc/nginx/sites-enabled/zalo-backup /etc/nginx/sites-available/zalo-backup
       setv TLS_CERT /etc/ssl/certs/zalo-backup.crt; setv TLS_KEY /etc/ssl/private/zalo-backup.key
       setv HTTPS_PORT "$sp"; setv DOMAIN "$d"; setv HOST 127.0.0.1
-      systemctl restart $SVC; sleep 3
-      code=$(curl -sk --max-time 6 -o /dev/null -w '%{http_code}' "https://127.0.0.1:$sp/view" || true)
+      systemctl restart $SVC
+      echo "Đang chờ bot khởi động (tối đa 40 giây)..."
+      code=000
+      for _ in $(seq 1 20); do
+        code=$(curl -sk --max-time 3 -o /dev/null -w '%{http_code}' "https://127.0.0.1:$sp/view" || true)
+        [ "$code" = 401 ] && break
+        sleep 2
+      done
       if [ "$code" = 401 ]; then
         echo "Xong: https://$d:$sp/view"
         echo "- Trình duyệt sẽ cảnh báo chứng chỉ tự ký: bấm 'Nâng cao' > 'Tiếp tục truy cập' (kết nối vẫn được mã hóa)."
         echo "- Nếu dùng ufw: ufw allow $sp/tcp. Cổng $(getv PORT) giờ chỉ truy cập nội bộ."
       else
-        echo "Chưa kết nối được HTTPS (mã $code). Xem log: zalo-backup logs"
+        echo "Chưa kết nối được HTTPS sau 40 giây (mã $code). Xem: journalctl -u $SVC -n 30 --no-pager"
         exit 1
       fi
       exit 0
@@ -735,6 +807,20 @@ NG
       echo "Không lấy được chứng chỉ HTTPS. Kiểm tra: tên miền đã trỏ về VPS chưa, cổng 80/443 đã mở chưa (ufw allow 80,443/tcp)."
       echo "Web vẫn chạy bình thường ở cổng $(getv PORT); chạy lại lệnh sau khi sửa."; exit 1
     fi ;;
+  ntfy)
+    case "${2:-}" in
+      off) delv NTFY_TOPIC; systemctl restart $SVC; echo "Đã tắt cảnh báo ntfy." ;;
+      test) t=$(getv NTFY_TOPIC); [ -n "$t" ] || { echo "Chưa bật. Dùng: zalo-backup ntfy auto"; exit 1; }
+            curl -fsS --max-time 10 -H "Title: Zalo Backup" --data-binary "🔔 Tin nhắn thử từ Zalo Backup" "https://ntfy.sh/$t" >/dev/null && echo "Đã gửi, kiểm tra app ntfy." || echo "Gửi lỗi." ;;
+      "") t=$(getv NTFY_TOPIC); if [ -n "$t" ]; then echo "Topic hiện tại: $t"; else echo "Dùng: zalo-backup ntfy auto | <tên-topic> | test | off"; fi ;;
+      *) t="$2"; [ "$t" = auto ] && t="zalo-backup-$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+         echo "$t" | grep -qE '^[A-Za-z0-9_-]{6,64}$' || { echo "Topic chỉ gồm chữ, số, - và _ (6-64 ký tự)."; exit 1; }
+         setv NTFY_TOPIC "$t"; systemctl restart $SVC
+         curl -fsS --max-time 10 -H "Title: Zalo Backup" --data-binary "✅ Zalo Backup đã kết nối ntfy" "https://ntfy.sh/$t" >/dev/null || echo "(Không gửi được tin thử, kiểm tra mạng VPS.)"
+         echo "Topic: $t"
+         echo "Cài app ntfy trên điện thoại, bấm + (Subscribe to topic), nhập đúng topic trên (server mặc định ntfy.sh)."
+         echo "Topic là 'mật khẩu' của kênh này, đừng chia sẻ." ;;
+    esac ;;
   search|recent|recalled|threads|ignore|unignore|only|filters|export) tool "$@" ;;
   stats) tool threads --size ;;
   clean) (cd "$APP" && set -a && . ./.env && set +a && node tool.mjs clean) ;;
@@ -757,6 +843,7 @@ zalo-backup <lệnh>
   https <tên-miền> [email]   Bật HTTPS (80/443 trống: Nginx + Let's Encrypt; bị chiếm: HTTPS tự ký cổng 8443). https off để tắt
  Cảnh báo
   telegram <token> <chat_id> | test | off
+  ntfy auto | <topic> | test | off   (thông báo đẩy về app ntfy, không cần tài khoản)
  Xem & tìm tin
   threads              Danh sách hội thoại (tên, dung lượng, trạng thái)
   stats                Như threads, xếp theo dung lượng
