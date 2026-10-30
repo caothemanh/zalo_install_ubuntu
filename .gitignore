@@ -1,0 +1,11 @@
+# Tự tạo bởi MTunnel-Gen khi push qua git lần đầu — sửa/xoá thoải mái nếu cần.
+.gradle/
+.idea/
+build/
+.externalNativeBuild/
+.cxx/
+node_modules/
+.acside/
+.androidide/
+local.properties
+*.iml
