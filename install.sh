@@ -89,7 +89,7 @@ const zalo = new Zalo({ selfListen: true });
 async function notifyQR() {
   let ip = "IP-VPS";
   try { ip = await (await fetch("https://api.ipify.org", { signal: AbortSignal.timeout(4000) })).text(); } catch {}
-  const base = process.env.DOMAIN ? `https://${process.env.DOMAIN}` : `http://${ip}:${PORT}`;
+  const base = process.env.DOMAIN ? `https://${process.env.DOMAIN}${process.env.HTTPS_PORT ? ":" + process.env.HTTPS_PORT : ""}` : `http://${ip}:${PORT}`;
   await notify(`🔑 Zalo Backup cần quét QR đăng nhập lại: ${base}`, "qr", 6 * 3600e3);
 }
 
@@ -607,7 +607,7 @@ getv() { grep -E "^$1=" "$ENVF" | head -1 | cut -d= -f2-; }
 setv() { { grep -v "^$1=" "$ENVF" || true; echo "$1=$2"; } > "$ENVF.tmp"; mv "$ENVF.tmp" "$ENVF"; chmod 600 "$ENVF"; }
 delv() { { grep -v "^$1=" "$ENVF" || true; } > "$ENVF.tmp"; mv "$ENVF.tmp" "$ENVF"; chmod 600 "$ENVF"; }
 ip() { curl -fsS --max-time 4 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}'; }
-url() { if [ -n "$(getv DOMAIN)" ]; then echo "https://$(getv DOMAIN)"; else echo "http://$(ip):$(getv PORT)"; fi; }
+url() { if [ -n "$(getv DOMAIN)" ]; then echo "https://$(getv DOMAIN)$( [ -n "$(getv HTTPS_PORT)" ] && echo ":$(getv HTTPS_PORT)")"; else echo "http://$(ip):$(getv PORT)"; fi; }
 tool() { (cd "$APP" && node tool.mjs "$@"); }
 tg() { curl -fsS --max-time 10 "https://api.telegram.org/bot$1/sendMessage" -d "chat_id=$2" --data-urlencode "text=$3"; }
 
@@ -658,13 +658,54 @@ case "${1:-help}" in
     if [ "$d" = off ]; then
       rm -f /etc/nginx/sites-enabled/zalo-backup /etc/nginx/sites-available/zalo-backup
       nginx -t && systemctl reload nginx
-      delv DOMAIN; setv HOST 0.0.0.0; systemctl restart $SVC
+      delv DOMAIN; delv HTTPS_PORT; setv HOST 0.0.0.0; systemctl restart $SVC
       echo "Đã gỡ cấu hình Nginx, web lại mở trực tiếp ở cổng $(getv PORT)."; exit 0
     fi
     [ -n "$d" ] || { echo "Dùng: zalo-backup nginx <tên-miền> [email]   (tên miền phải trỏ A record về IP VPS)"; echo "      zalo-backup nginx off"; exit 1; }
     command -v nginx >/dev/null || { apt-get update -y && apt-get install -y nginx; }
     mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
-    cat > /etc/nginx/sites-available/zalo-backup <<'NG'
+    CONF=/etc/nginx/sites-available/zalo-backup
+    reload_nginx() { if systemctl is-active --quiet nginx; then systemctl reload nginx; else systemctl enable --now nginx; fi; }
+    busy=$(ss -tlnp | awk '$4 ~ /:(80|443)$/ && $0 !~ /nginx/' | wc -l)
+
+    if [ "$busy" -gt 0 ]; then
+      # Cổng 80/443 đang bị chương trình khác (vd psiphond) giữ -> HTTPS cổng 8443 với chứng chỉ tự ký
+      sp=8443
+      [ "$(ss -tlnp | awk -v p=":$sp$" '$4 ~ p && $0 !~ /nginx/' | wc -l)" -eq 0 ] || { echo "Cổng $sp cũng đang bị dùng, giải phóng cổng này rồi chạy lại."; exit 1; }
+      echo "Cổng 80/443 đang bị chương trình khác dùng (psiphond?), chuyển sang HTTPS cổng $sp với chứng chỉ tự ký."
+      mkdir -p /etc/ssl/private /etc/ssl/certs
+      openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout /etc/ssl/private/zalo-backup.key \
+        -out /etc/ssl/certs/zalo-backup.crt -subj "/CN=$d" -addext "subjectAltName=DNS:$d" 2>/dev/null \
+        || { echo "Tạo chứng chỉ lỗi (cần openssl)."; exit 1; }
+      chmod 600 /etc/ssl/private/zalo-backup.key
+      cat > $CONF <<'NG'
+server {
+    listen @SP@ ssl;
+    server_name @DOMAIN@;
+    ssl_certificate /etc/ssl/certs/zalo-backup.crt;
+    ssl_certificate_key /etc/ssl/private/zalo-backup.key;
+    client_max_body_size 1m;
+    location / {
+        proxy_pass http://127.0.0.1:@PORT@;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 120s;
+    }
+}
+NG
+      sed -i "s/@DOMAIN@/$d/; s/@PORT@/$(getv PORT)/; s/@SP@/$sp/" $CONF
+      ln -sf $CONF /etc/nginx/sites-enabled/zalo-backup
+      nginx -t || { rm -f /etc/nginx/sites-enabled/zalo-backup; echo "Cấu hình Nginx lỗi, đã hoàn tác."; exit 1; }
+      reload_nginx
+      setv DOMAIN "$d"; setv HTTPS_PORT "$sp"; setv HOST 127.0.0.1; systemctl restart $SVC
+      echo "Xong: https://$d:$sp/view"
+      echo "- Trình duyệt sẽ cảnh báo chứng chỉ tự ký: bấm 'Nâng cao' > 'Tiếp tục truy cập' (kết nối vẫn được mã hóa)."
+      echo "- Nếu dùng ufw: ufw allow $sp/tcp. Cổng $(getv PORT) giờ chỉ truy cập nội bộ."
+      exit 0
+    fi
+
+    cat > $CONF <<'NG'
 server {
     listen 80;
     server_name @DOMAIN@;
@@ -678,14 +719,14 @@ server {
     }
 }
 NG
-    sed -i "s/@DOMAIN@/$d/; s/@PORT@/$(getv PORT)/" /etc/nginx/sites-available/zalo-backup
-    ln -sf /etc/nginx/sites-available/zalo-backup /etc/nginx/sites-enabled/zalo-backup
+    sed -i "s/@DOMAIN@/$d/; s/@PORT@/$(getv PORT)/" $CONF
+    ln -sf $CONF /etc/nginx/sites-enabled/zalo-backup
     nginx -t || { rm -f /etc/nginx/sites-enabled/zalo-backup; echo "Cấu hình Nginx lỗi, đã hoàn tác."; exit 1; }
-    systemctl reload nginx
+    reload_nginx
     command -v certbot >/dev/null || apt-get install -y certbot python3-certbot-nginx
     if [ -n "${3:-}" ]; then em=(-m "$3"); else em=(--register-unsafely-without-email); fi
     if certbot --nginx -d "$d" --non-interactive --agree-tos "${em[@]}" --redirect; then
-      setv DOMAIN "$d"; setv HOST 127.0.0.1; systemctl restart $SVC
+      setv DOMAIN "$d"; delv HTTPS_PORT; setv HOST 127.0.0.1; systemctl restart $SVC
       echo "Xong: https://$d  (xem tin: https://$d/view). Cổng $(getv PORT) giờ chỉ nội bộ."
     else
       echo "Không lấy được chứng chỉ HTTPS. Kiểm tra: tên miền đã trỏ về VPS chưa, cổng 80/443 đã mở chưa (ufw allow 80,443/tcp)."
@@ -710,7 +751,7 @@ zalo-backup <lệnh>
   days M [T]           Giữ media M ngày, tin chữ T ngày (0 = vĩnh viễn)
   set KEY VALUE        MEDIA_DAYS TEXT_DAYS COMPRESS_DAYS MAX_FILE_MB MIN_FREE_GB PORT HOST AUTH_USER AUTH_PASS
   config | passwd [mới] | clean | update [link] | uninstall
-  nginx <tên-miền> [email]   Bật HTTPS qua Nginx + Let's Encrypt (nginx off để gỡ)
+  nginx <tên-miền> [email]   Bật HTTPS qua Nginx (Let's Encrypt; nếu cổng 80/443 bị chiếm thì tự dùng cổng 8443 tự ký). nginx off để gỡ
  Cảnh báo
   telegram <token> <chat_id> | test | off
  Xem & tìm tin
@@ -777,7 +818,7 @@ IP=$(curl -fsS https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1
 echo
 echo "=============================================="
 echo " Cài xong!"
-if [ -n "${DOMAIN:-}" ]; then echo " Web:      https://$DOMAIN   (xem tin: /view)"; else echo " Web:      http://$IP:$PORT   (xem tin: /view)"; fi
+echo " Web:      http://$IP:$PORT   (xem tin: /view)"
 echo " User:     $AUTH_USER"
 echo " Password: $AUTH_PASS"
 echo " Tin nhắn: $APP_DIR/backup/<threadId>/<ngày>.jsonl"
