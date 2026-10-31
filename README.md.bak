@@ -5,7 +5,7 @@
 ## Cài đặt (Ubuntu, 1 lệnh)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/USER/REPO/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/caothemanh/zalo_install_ubuntu/main/install.sh | sudo bash
 ```
 
 Cổng khác: `curl -fsSL ... | sudo PORT=8080 bash`
