@@ -79,6 +79,7 @@ app.use((req, res, next) => {
 });
 registerViewer(app);
 app.use("/fb", express.urlencoded({ extended: false, limit: "2mb" }));
+app.use("/api/fb", express.json({ limit: "2mb" }));
 registerFb(app);
 registerApi(app, () => ({ status, qr: qrImage, fb: readJson("./fb_status.json", null) }));
 app.get("/", (_, res) => res.send(
@@ -625,6 +626,22 @@ Chat đã bật mã hóa đầu-cuối sẽ không đọc được; nhóm và ch
       catch (e) { return show(res, `Đã lưu ${n} cookie nhưng không khởi động được dịch vụ: ${esc(e.message)}`, 500); }
       res.redirect("/fb?ok=1");
     } catch (e) { show(res, "✗ Cookie không hợp lệ: " + esc(e.message), 400); }
+  });
+  // API cho app Android (JSON)
+  app.post("/api/fb/appstate", async (req, res) => {
+    try {
+      let raw = req.body?.cookies;
+      if (typeof raw === "string") raw = JSON.parse(raw);
+      const n = saveAppState(raw);
+      await run("systemctl", ["enable", FB_SERVICE]);
+      await run("systemctl", ["restart", FB_SERVICE]);
+      res.json({ ok: true, count: n });
+    } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+  });
+  app.post("/api/fb/logout", async (req, res) => {
+    try { await run("systemctl", ["disable", "--now", FB_SERVICE]); } catch {}
+    fs.rmSync(FB_APPSTATE, { force: true }); fs.rmSync(FB_STATUS, { force: true });
+    res.json({ ok: true });
   });
   app.post("/fb/logout", async (req, res) => {
     try { await run("systemctl", ["disable", "--now", FB_SERVICE]); } catch {}
