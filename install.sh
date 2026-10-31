@@ -35,10 +35,10 @@ cd $APP_DIR
 cat > package.json <<'PKG'
 {
   "name": "zalo-backup",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "type": "module",
   "main": "server.js",
-  "dependencies": { "zca-js": "latest", "express": "^4" }
+  "dependencies": { "zca-js": "latest", "express": "^4", "ws3-fca": "3.5.2" }
 }
 PKG
 
@@ -51,7 +51,7 @@ import https from "https";
 import { Readable } from "stream";
 import { pipeline } from "stream/promises";
 import {
-  BACKUP_DIR, allowed, loadNames, setName, markRecalled, notify, freeGB, maintenance, registerViewer, registerApi,
+  BACKUP_DIR, allowed, loadNames, setName, markRecalled, notify, freeGB, maintenance, registerViewer, registerApi, registerFb, readJson,
 } from "./lib.mjs";
 
 const CRED = "./cred.json";
@@ -78,10 +78,12 @@ app.use((req, res, next) => {
   res.set("WWW-Authenticate", 'Basic realm="zalo"').status(401).end();
 });
 registerViewer(app);
-registerApi(app, () => ({ status, qr: qrImage }));
+app.use("/fb", express.urlencoded({ extended: false, limit: "2mb" }));
+registerFb(app);
+registerApi(app, () => ({ status, qr: qrImage, fb: readJson("./fb_status.json", null) }));
 app.get("/", (_, res) => res.send(
   `<meta name=viewport content="width=device-width"><meta http-equiv=refresh content=3>` +
-  `<h3>Trạng thái: ${status}</h3><p><a href="/view">Xem tin nhắn đã lưu</a></p>` +
+  `<h3>Trạng thái: ${status}</h3><p><a href="/view">Xem tin nhắn đã lưu</a> · <a href="/fb">Facebook</a></p>` +
   (qrImage ? `<img src="${qrImage.startsWith("data:") ? qrImage : "data:image/png;base64," + qrImage}">` : "")));
 app.listen(PORT, HOST, () => console.log(`Web: http://${HOST}:${PORT}`));
 // HTTPS tích hợp (tự ký) khi cổng 80/443 bị chương trình khác chiếm: không cần Nginx
@@ -246,7 +248,10 @@ cat > lib.mjs <<'LIB'
 import fs from "fs";
 import path from "path";
 import zlib from "zlib";
-import { execSync } from "child_process";
+import { execSync, execFile } from "child_process";
+import { promisify } from "util";
+import { Readable } from "stream";
+import { pipeline } from "stream/promises";
 
 export const BACKUP_DIR = process.env.BACKUP_DIR || "./backup";
 export const NAMES_FILE = process.env.NAMES_FILE || "./names.json";
@@ -452,7 +457,7 @@ export function registerViewer(app) {
       .sort((a, b) => b.last.localeCompare(a.last));
     const li = rows.map((r) => {
       const nm = names[r.id], off = f.only.length ? !f.only.includes(r.id) : f.ignore.includes(r.id);
-      return `<a class=row href="/view/t/${r.id}"><span>${nm?.type === "group" ? "👥" : "👤"} ${esc(nm?.name || r.id)}${off ? " 🚫" : ""}</span><span class=meta>${esc(r.last)}</span></a>`;
+      return `<a class=row href="/view/t/${r.id}"><span>${nm?.type === "group" ? "👥" : "👤"} ${nm?.source === "fb" ? "[FB] " : ""}${esc(nm?.name || r.id)}${off ? " 🚫" : ""}</span><span class=meta>${esc(r.last)}</span></a>`;
     }).join("");
     res.send(page("Tin nhắn Zalo", `<h2>Tin nhắn đã lưu</h2><form action=/view/search><input name=q placeholder="Tìm kiếm (không cần dấu)..."> <button>Tìm</button></form>${li || "<p>Chưa có tin nào.</p>"}<p class=meta><a href="/">← Trạng thái</a></p>`));
   });
@@ -513,7 +518,7 @@ export function registerApi(app, getState) {
   app.get("/api/status", (req, res) => {
     const s = getState();
     const qr = s.qr ? (String(s.qr).startsWith("data:") ? s.qr : "data:image/png;base64," + s.qr) : null;
-    res.json({ status: s.status, qr, threads: threadDirs().length });
+    res.json({ status: s.status, qr, fb: s.fb || null, threads: threadDirs().length });
   });
 
   app.get("/api/threads", (req, res) => {
@@ -526,7 +531,7 @@ export function registerApi(app, getState) {
         if (m) { preview = (m.isSelf ? "Tôi: " : "") + msgText(m).slice(0, 100); ts = msgTime(m); }
       }
       const off = f.only.length ? !f.only.includes(id) : f.ignore.includes(id);
-      return { id, name: names[id]?.name || id, type: names[id]?.type || "user", last, preview, ts, off };
+      return { id, name: names[id]?.name || id, type: names[id]?.type || "user", source: names[id]?.source || "zalo", last, preview, ts, off };
     }).sort((a, b) => b.ts - a.ts || b.last.localeCompare(a.last)).slice(0, 300);
     res.json({ items });
   });
@@ -553,6 +558,80 @@ export function registerApi(app, getState) {
     res.json({ items });
   });
 }
+
+// ---------- Tiện ích dùng chung (Zalo + Facebook) ----------
+export function writeLine(id, time, obj) {
+  const dir = path.join(BACKUP_DIR, id);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.appendFileSync(path.join(dir, time.slice(0, 10) + ".jsonl"), JSON.stringify(obj) + "\n");
+}
+
+// Tải url về file, giới hạn dung lượng. Trả "ok" hoặc lý do bỏ qua/thất bại.
+export async function downloadTo(url, file, limit) {
+  const res = await fetch(url, { signal: AbortSignal.timeout(60000) });
+  if (!res.ok) return "failed: HTTP " + res.status;
+  if (Number(res.headers.get("content-length") || 0) > limit) return "skipped: too large";
+  let size = 0;
+  try {
+    await pipeline(
+      Readable.fromWeb(res.body),
+      async function* (src) { for await (const ch of src) { size += ch.length; if (size > limit) throw new Error("too large"); yield ch; } },
+      fs.createWriteStream(file)
+    );
+  } catch (e) { fs.rmSync(file, { force: true }); return "skipped: " + e.message; }
+  return "ok";
+}
+
+// ---------- Facebook: cookie (appstate) + trang dán cookie ----------
+const FB_APPSTATE = process.env.FB_APPSTATE || "./fb_appstate.json";
+const FB_STATUS = process.env.FB_STATUS || "./fb_status.json";
+const FB_SERVICE = process.env.FB_SERVICE || "zalo-backup-fb";
+const run = promisify(execFile);
+
+export function normalizeAppState(raw) {
+  const arr = Array.isArray(raw) ? raw : raw?.cookies;
+  if (!Array.isArray(arr) || !arr.length) throw new Error("cần một mảng cookie JSON");
+  const out = arr.map((c) => ({ ...c, key: c.key ?? c.name, domain: c.domain || "facebook.com", path: c.path || "/" }))
+    .filter((c) => c.key && c.value !== undefined);
+  const keys = new Set(out.map((c) => c.key));
+  if (!keys.has("c_user") || !keys.has("xs")) throw new Error("thiếu cookie c_user hoặc xs (đăng nhập facebook.com rồi xuất lại cookie)");
+  return out;
+}
+export function saveAppState(raw) {
+  const arr = normalizeAppState(raw);
+  fs.writeFileSync(FB_APPSTATE, JSON.stringify(arr), { mode: 0o600 });
+  fs.chmodSync(FB_APPSTATE, 0o600);
+  return arr.length;
+}
+
+export function registerFb(app) {
+  const show = (res, msg, code = 200) => {
+    const st = readJson(FB_STATUS, null), has = fs.existsSync(FB_APPSTATE);
+    res.status(code).send(page("Facebook", `<a href="/">← Trạng thái</a><h2>Facebook Messenger</h2>
+<p><b>Trạng thái:</b> ${esc(st?.status || (has ? "Đang khởi động..." : "Chưa đăng nhập"))}</p>${msg ? `<p>${msg}</p>` : ""}
+<form method=post action="/fb/appstate"><p>Dán cookie (JSON) của tài khoản Facebook:</p>
+<textarea name=cookies rows=7 style="width:100%" placeholder='[{"name":"c_user","value":"..."},{"name":"xs","value":"..."}, ...]'></textarea>
+<p><button>Lưu và kết nối</button></p></form>
+${has ? `<form method=post action="/fb/logout"><button>Ngắt kết nối Facebook</button></form>` : ""}
+<p class=meta>Cách lấy cookie: đăng nhập facebook.com trên trình duyệt (Chrome/Kiwi/Firefox), cài tiện ích Cookie-Editor, chọn Export → JSON, rồi dán vào đây.
+Nên dùng nick phụ: đây là cách không chính thức, Facebook có thể yêu cầu xác minh hoặc khóa tài khoản.
+Chat đã bật mã hóa đầu-cuối sẽ không đọc được; nhóm và chat thường vẫn lưu được.</p>`));
+  };
+  app.get("/fb", (req, res) => show(res, req.query.ok ? "✓ Đã lưu cookie, đang kết nối (vài giây)..." : ""));
+  app.post("/fb/appstate", async (req, res) => {
+    try {
+      const n = saveAppState(JSON.parse(String(req.body?.cookies || "")));
+      try { await run("systemctl", ["enable", FB_SERVICE]); await run("systemctl", ["restart", FB_SERVICE]); }
+      catch (e) { return show(res, `Đã lưu ${n} cookie nhưng không khởi động được dịch vụ: ${esc(e.message)}`, 500); }
+      res.redirect("/fb?ok=1");
+    } catch (e) { show(res, "✗ Cookie không hợp lệ: " + esc(e.message), 400); }
+  });
+  app.post("/fb/logout", async (req, res) => {
+    try { await run("systemctl", ["disable", "--now", FB_SERVICE]); } catch {}
+    fs.rmSync(FB_APPSTATE, { force: true }); fs.rmSync(FB_STATUS, { force: true });
+    res.redirect("/fb");
+  });
+}
 LIB
 
 cat > tool.mjs <<'TOOL'
@@ -560,7 +639,7 @@ import fs from "fs";
 import path from "path";
 import {
   BACKUP_DIR, FILTERS_FILE, loadNames, loadFilters, threadDirs, threadDays, readDay, recalledSet,
-  searchAll, recentMsgs, msgText, msgTime, fmtTime, renderMsg, page, esc, norm, dirSize, maintenance,
+  searchAll, recentMsgs, msgText, msgTime, fmtTime, renderMsg, page, esc, norm, dirSize, maintenance, saveAppState,
 } from "./lib.mjs";
 
 const [cmd, ...args] = process.argv.slice(2);
@@ -611,10 +690,10 @@ switch (cmd) {
     const f = loadFilters();
     const rows = threadDirs().map((id) => {
       const d = threadDays(id), off = f.only.length ? !f.only.includes(id) : f.ignore.includes(id);
-      return { id, type: names[id]?.type === "group" ? "nhóm" : "cá nhân", name: nameOf(id), size: dirSize(path.join(BACKUP_DIR, id)), last: d[d.length - 1] || "", off };
+      return { id, type: (names[id]?.source === "fb" ? "FB " : "") + (names[id]?.type === "group" ? "nhóm" : "cá nhân"), name: nameOf(id), size: dirSize(path.join(BACKUP_DIR, id)), last: d[d.length - 1] || "", off };
     });
     rows.sort(args[0] === "--size" ? (a, b) => b.size - a.size : (a, b) => b.last.localeCompare(a.last));
-    for (const r of rows) console.log(`${r.id.padEnd(22)} ${r.type.padEnd(8)} ${human(r.size).padStart(6)}  ${r.last}  ${r.off ? "🚫 " : ""}${r.name}`);
+    for (const r of rows) console.log(`${r.id.padEnd(22)} ${r.type.padEnd(12)} ${human(r.size).padStart(6)}  ${r.last}  ${r.off ? "🚫 " : ""}${r.name}`);
     if (!rows.length) console.log("Chưa có hội thoại nào.");
     break;
   }
@@ -660,6 +739,11 @@ switch (cmd) {
     console.log(`Đã xuất ${n} tin, ${copied} file media ra: ${path.resolve(out)}\n(chat.html, chat.txt, media/) — tải về bằng scp hoặc zip.`);
     break;
   }
+  case "fbsave": {
+    if (!args[0] || !fs.existsSync(args[0])) die("Dùng: zalo-backup fb appstate <file-cookie.json>");
+    try { console.log(`Đã lưu ${saveAppState(JSON.parse(fs.readFileSync(args[0], "utf8")))} cookie.`); } catch (e) { die("Cookie không hợp lệ: " + e.message); }
+    break;
+  }
   case "clean": {
     const r = maintenance({ mediaDays: Number(process.env.MEDIA_DAYS) || 10, textDays: Number(process.env.TEXT_DAYS) || 0, compressDays: Number(process.env.COMPRESS_DAYS) || 0 });
     console.log(`Xóa ${r.media} media quá hạn, xóa ${r.text} file tin chữ quá hạn, nén ${r.compressed} file.`);
@@ -668,6 +752,150 @@ switch (cmd) {
   default: die("Lệnh không hợp lệ");
 }
 TOOL
+
+cat > fb.mjs <<'FB'
+// Sao lưu Messenger (Facebook) vào cùng thư mục backup với Zalo. Chạy như một dịch vụ riêng.
+import fs from "fs";
+import path from "path";
+import { pathToFileURL } from "url";
+import { BACKUP_DIR, allowed, loadNames, setName, markRecalled, freeGB, writeJson, writeLine, downloadTo } from "./lib.mjs";
+
+const APPSTATE = process.env.FB_APPSTATE || "./fb_appstate.json";
+const STATUS = process.env.FB_STATUS || "./fb_status.json";
+const MAX_FILE_MB = Number(process.env.MAX_FILE_MB) || 20;
+const MIN_FREE_GB = Number(process.env.MIN_FREE_GB) || 2;
+const setStatus = (status, extra = {}) => { try { writeJson(STATUS, { status, at: Date.now(), ...extra }); } catch {} };
+const safe = (n) => String(n).replace(/[^\w.\-()\u00C0-\u1EF9 ]/g, "_").slice(0, 120);
+const KIND_EXT = { photo: ".jpg", animated_image: ".gif", video: ".mp4", audio: ".m4a", file: "" };
+
+export function attach(api, { onFatal } = {}) {
+  const me = String(api.getCurrentUserID());
+  const userCache = new Map(), lastTry = new Map();
+
+  async function userName(uid) {
+    uid = String(uid);
+    if (userCache.has(uid)) return userCache.get(uid);
+    let name = uid;
+    try { const r = await api.getUserInfo([uid]); name = r?.[uid]?.name || r?.name || uid; } catch {}
+    userCache.set(uid, name);
+    return name;
+  }
+
+  async function threadName(ev, id) {
+    const cur = loadNames()[id];
+    if (cur?.name && Date.now() - (cur.at || 0) < 7 * 86400e3) return cur.name;
+    if (Date.now() - (lastTry.get(id) || 0) < 600e3) return cur?.name || "";
+    lastTry.set(id, Date.now());
+    let name = "";
+    try {
+      if (ev.isGroup) {
+        const t = await api.getThreadInfo(String(ev.threadID));
+        name = t?.threadName || (t?.userInfo || []).slice(0, 3).map((u) => u.name).filter(Boolean).join(", ");
+      } else name = await userName(ev.threadID);
+    } catch {}
+    setName(id, { name: name || cur?.name || "", type: ev.isGroup ? "group" : "user", source: "fb", at: name ? Date.now() : 0 });
+    return name || cur?.name || "";
+  }
+
+  async function saveAttachment(a, id, msgId, i) {
+    const url = a.url || a.largePreviewUrl || a.previewUrl;
+    if (!url) return "failed: no url";
+    if (freeGB() < MIN_FREE_GB) return "skipped: disk low";
+    let name = a.filename || a.name || "file";
+    if (!path.extname(name)) name += KIND_EXT[a.type] || "";
+    const dir = path.join(BACKUP_DIR, id, "media");
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `${safe(msgId)}_${i}_${safe(name)}`);
+    const r = await downloadTo(url, file, MAX_FILE_MB * 1048576);
+    return r === "ok" ? path.relative(BACKUP_DIR, file) : r;
+  }
+
+  async function handleMessage(ev) {
+    const tid = String(ev.threadID), id = "fb_" + tid;
+    if (!allowed(id)) return;
+    const self = String(ev.senderID) === me;
+    const tname = await threadName(ev, id);
+    const atts = Array.isArray(ev.attachments) ? ev.attachments : [];
+    let content = ev.body || "";
+    const share = atts.find((a) => a.type === "share");
+    if (!content && share) content = { title: share.title, description: share.description, href: share.url || share.source };
+    else if (!content && atts.some((a) => a.type === "sticker")) content = "[sticker]";
+    else if (!content && atts.some((a) => a.type === "location")) content = "[vị trí]";
+    const time = new Date().toISOString();
+    const base = {
+      time, threadId: id, thread: tname || undefined, source: "fb", type: ev.isGroup ? 1 : 0, isSelf: self,
+      msgId: ev.messageID, from: String(ev.senderID), name: await userName(ev.senderID), msgType: "fb." + ev.type,
+      content, ts: Number(ev.timestamp) || Date.now(),
+    };
+    const media = atts.filter((a) => a.type in KIND_EXT);
+    if (!media.length) return writeLine(id, time, base);
+    for (let i = 0; i < media.length; i++) {
+      let m;
+      try { m = await saveAttachment(media[i], id, ev.messageID, i); } catch (e) { m = "failed: " + e.message; }
+      writeLine(id, time, i === 0 ? { ...base, media: m } : { ...base, content: "", part: i + 1, media: m });
+    }
+  }
+
+  function handleUnsend(ev) {
+    const id = "fb_" + String(ev.threadID);
+    if (!allowed(id)) return;
+    const time = new Date().toISOString();
+    writeLine(id, time, { time, event: "undo", threadId: id, source: "fb", isSelf: String(ev.senderID) === me, targetMsgId: String(ev.messageID), from: String(ev.senderID), raw: ev });
+    markRecalled(id, String(ev.messageID));
+  }
+
+  let errs = [];
+  api.listenMqtt(async (err, ev) => {
+    if (err) {
+      const msg = String(err?.error || err?.message || err);
+      console.error("listen error:", msg);
+      const now = Date.now();
+      errs = errs.filter((t) => now - t < 60000); errs.push(now);
+      const hard = /not logged in|checkpoint|login|cookie|session/i.test(msg);
+      if (hard || errs.length >= 5) onFatal?.(msg, hard);
+      return;
+    }
+    try {
+      if (ev.type === "message" || ev.type === "message_reply") await handleMessage(ev);
+      else if (ev.type === "message_unsend") handleUnsend(ev);
+    } catch (e) { console.error("fb handler error", e); }
+  });
+  return { handleMessage, handleUnsend };
+}
+
+async function main() {
+  if (!fs.existsSync(APPSTATE)) {
+    setStatus("Chưa đăng nhập: dán cookie ở trang /fb");
+    console.log("Chưa có fb_appstate.json, thoát.");
+    process.exit(0);
+  }
+  let appState;
+  try { appState = JSON.parse(fs.readFileSync(APPSTATE, "utf8")); }
+  catch { setStatus("File cookie bị hỏng, dán lại ở trang /fb"); process.exit(0); }
+  const { default: fca } = await import("ws3-fca");
+  setStatus("Đang đăng nhập...");
+  const net = /ENOTFOUND|ETIMEDOUT|ECONNRESET|EAI_AGAIN|ECONNREFUSED|network|timeout/i;
+  fca.login({ appState }, {
+    online: false, updatePresence: false, selfListen: true, listenEvents: true,
+    autoMarkRead: false, autoMarkDelivery: false, listenTyping: false, autoReconnect: true,
+  }, (err, api) => {
+    if (err) {
+      const msg = String(err?.error || err?.message || JSON.stringify(err));
+      console.error("Lỗi đăng nhập:", msg);
+      setStatus("Lỗi đăng nhập: " + msg.slice(0, 200));
+      process.exit(net.test(msg) ? 1 : 0); // lỗi cookie/checkpoint: không thử lại liên tục để tránh bị khóa
+    }
+    attach(api, {
+      onFatal: (msg, hard) => { setStatus((hard ? "Cần đăng nhập lại: " : "Lỗi kết nối: ") + msg.slice(0, 200)); process.exit(hard ? 0 : 1); },
+    });
+    setStatus("Online - đang sao lưu", { uid: String(api.getCurrentUserID()) });
+    console.log("Facebook: đã đăng nhập", api.getCurrentUserID());
+    setInterval(() => { try { fs.writeFileSync(APPSTATE, JSON.stringify(api.getAppState()), { mode: 0o600 }); } catch {} }, 30 * 60 * 1000);
+  });
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) main();
+FB
 
 rm -f fmt.mjs
 
@@ -682,6 +910,8 @@ delv() { { grep -v "^$1=" "$ENVF" || true; } > "$ENVF.tmp"; mv "$ENVF.tmp" "$ENV
 ip() { curl -fsS --max-time 4 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}'; }
 url() { if [ -n "$(getv DOMAIN)" ]; then echo "https://$(getv DOMAIN)$( [ -n "$(getv HTTPS_PORT)" ] && echo ":$(getv HTTPS_PORT)")"; else echo "http://$(ip):$(getv PORT)"; fi; }
 tool() { (cd "$APP" && node tool.mjs "$@"); }
+FBSVC=zalo-backup-fb
+fbstat() { local s=""; [ -f "$APP/fb_status.json" ] && s=$(cd "$APP" && node -e 'try{console.log(JSON.parse(require("fs").readFileSync("fb_status.json","utf8")).status)}catch{}'); echo "$(systemctl is-active $FBSVC 2>/dev/null) ${s:+- $s}"; }
 tg() { curl -fsS --max-time 10 "https://api.telegram.org/bot$1/sendMessage" -d "chat_id=$2" --data-urlencode "text=$3"; }
 
 case "${1:-help}" in
@@ -694,6 +924,7 @@ case "${1:-help}" in
     echo "Media:     $(find $BK -path '*/media/*' -type f 2>/dev/null | wc -l) file, $(du -ch $BK/*/media 2>/dev/null | tail -1 | cut -f1)"
     echo "Giữ:       media $(getv MEDIA_DAYS) ngày, tin chữ $( [ "$(getv TEXT_DAYS)" = 0 ] && echo vĩnh viễn || echo "$(getv TEXT_DAYS) ngày"), nén sau $( [ "$(getv COMPRESS_DAYS)" = 0 ] && echo "(tắt)" || echo "$(getv COMPRESS_DAYS) ngày")"
     echo "Cảnh báo:  Telegram $( [ -n "$(getv TG_TOKEN)" ] && echo bật || echo tắt), ntfy $( [ -n "$(getv NTFY_TOPIC)" ] && echo bật || echo tắt)"
+    echo "Facebook:  $(fbstat)"
     echo "Web xem tin: $(url)/view" ;;
   info)    echo "Web: $(url)  (xem tin: $(url)/view)"; echo "User: $(getv AUTH_USER)"; echo "Pass: $(getv AUTH_PASS)"
     [ -n "$(getv TLS_CERT)" ] && echo "Vân tay chứng chỉ (SHA-256, dùng cho app Android): $(openssl x509 -in "$(getv TLS_CERT)" -noout -fingerprint -sha256 | cut -d= -f2)"; true ;;
@@ -821,6 +1052,15 @@ NG
          echo "Cài app ntfy trên điện thoại, bấm + (Subscribe to topic), nhập đúng topic trên (server mặc định ntfy.sh)."
          echo "Topic là 'mật khẩu' của kênh này, đừng chia sẻ." ;;
     esac ;;
+  fb)
+    case "${2:-status}" in
+      status) echo "Facebook: $(fbstat)"; [ -f "$APP/fb_appstate.json" ] || echo "Chưa đăng nhập: dán cookie ở $(url)/fb hoặc dùng: zalo-backup fb appstate <file.json>" ;;
+      appstate) tool fbsave "$(readlink -f "${3:-/nonexistent}")" && systemctl enable $FBSVC >/dev/null 2>&1 && systemctl restart $FBSVC && echo "Đã khởi động dịch vụ Facebook. Kiểm tra: zalo-backup fb status" ;;
+      logout) systemctl disable --now $FBSVC 2>/dev/null; rm -f "$APP/fb_appstate.json" "$APP/fb_status.json"; echo "Đã ngắt kết nối Facebook và xóa cookie (tin đã lưu vẫn còn)." ;;
+      start|stop|restart) systemctl "$2" $FBSVC && echo "OK: fb $2" ;;
+      logs) journalctl -u $FBSVC -n "${3:-50}" -f --no-pager ;;
+      *) echo "Dùng: zalo-backup fb status | appstate <file> | logout | restart | logs"; exit 1 ;;
+    esac ;;
   search|recent|recalled|threads|ignore|unignore|only|filters|export) tool "$@" ;;
   stats) tool threads --size ;;
   clean) (cd "$APP" && set -a && . ./.env && set +a && node tool.mjs clean) ;;
@@ -841,6 +1081,8 @@ zalo-backup <lệnh>
   set KEY VALUE        MEDIA_DAYS TEXT_DAYS COMPRESS_DAYS MAX_FILE_MB MIN_FREE_GB PORT HOST AUTH_USER AUTH_PASS
   config | passwd [mới] | clean | update [link] | uninstall
   https <tên-miền> [email]   Bật HTTPS (80/443 trống: Nginx + Let's Encrypt; bị chiếm: HTTPS tự ký cổng 8443). https off để tắt
+ Facebook Messenger (lưu chung với Zalo, xem chung trong web/app)
+  fb status | appstate <file.json> | logout | restart | logs   (hoặc dán cookie ở trang /fb trên web)
  Cảnh báo
   telegram <token> <chat_id> | test | off
   ntfy auto | <topic> | test | off   (thông báo đẩy về app ntfy, không cần tài khoản)
@@ -898,9 +1140,28 @@ RestartSec=5
 WantedBy=multi-user.target
 UNIT
 
+cat > /etc/systemd/system/$SERVICE-fb.service <<UNIT
+[Unit]
+Description=Zalo Backup - Facebook Messenger
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=$APP_DIR
+EnvironmentFile=$APP_DIR/.env
+ExecStart=$(command -v node) fb.mjs
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
 systemctl daemon-reload
 systemctl enable --now $SERVICE
 systemctl restart $SERVICE
+# dịch vụ Facebook chỉ chạy khi đã có cookie (dán ở trang /fb hoặc: zalo-backup fb appstate <file>)
+[ -f fb_appstate.json ] && systemctl enable $SERVICE-fb && systemctl restart $SERVICE-fb || true
 [ -f cred.json ] && chmod 600 cred.json || true
 
 set -a; . ./.env; set +a
@@ -912,5 +1173,6 @@ echo " Web:      http://$IP:$PORT   (xem tin: /view)"
 echo " User:     $AUTH_USER"
 echo " Password: $AUTH_PASS"
 echo " Tin nhắn: $APP_DIR/backup/<threadId>/<ngày>.jsonl"
+echo " Facebook:  dán cookie ở trang /fb (web) hoặc: zalo-backup fb appstate <file>"
 echo " Quản lý:  zalo-backup help"
 echo "=============================================="
