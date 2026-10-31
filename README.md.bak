@@ -5,7 +5,7 @@
 ## Cài đặt (Ubuntu, 1 lệnh)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/caothemanh/zalo_install_ubuntu/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/USER/REPO/main/install.sh | sudo bash
 ```
 
 Cổng khác: `curl -fsSL ... | sudo PORT=8080 bash`
@@ -25,6 +25,16 @@ Chỉnh trong `/opt/zalo-backup/.env` rồi `systemctl restart zalo-backup`:
 - **Cảnh báo Telegram**: mất kết nối, cần quét QR lại, ổ đĩa sắp đầy.
 - **Nén gzip** file tin chữ cũ hơn 30 ngày (vẫn tìm kiếm/xem bình thường).
 - **Export** một hội thoại ra HTML + txt (kèm media còn lưu).
+
+## Facebook Messenger (tùy chọn)
+Chạy như dịch vụ riêng `zalo-backup-fb`, lưu chung thư mục (`backup/fb_<id>/`), xem chung trong web `/view` và app.
+1. Đăng nhập facebook.com trên trình duyệt (nên dùng **nick phụ**), cài Cookie-Editor, Export → JSON.
+2. Dán JSON vào trang `https://<máy chủ>/fb` (hoặc `zalo-backup fb appstate <file.json>`).
+3. Kiểm tra: `zalo-backup fb status`.
+
+Tin thu hồi được giữ lại và đánh dấu 🗑 như Zalo. **Giới hạn:** chat đã bật mã hóa đầu-cuối không đọc được;
+đây là cách không chính thức nên Facebook có thể yêu cầu xác minh hoặc khóa tài khoản. Khi cookie hết hạn hoặc bị
+checkpoint, dịch vụ tự dừng (không thử lại liên tục) và báo trạng thái ở `/fb`.
 
 ## Quản lý bằng terminal
 ```bash
