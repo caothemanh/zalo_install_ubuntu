@@ -3,10 +3,9 @@
 Đăng nhập Zalo bằng QR trên web, tự sao lưu tin nhắn đến/đi vào `/opt/zalo-backup/backup/`.
 
 ## Cài đặt (Ubuntu, 1 lệnh)
-....bash
+```bash
 curl -fsSL https://raw.githubusercontent.com/caothemanh/zalo_install_ubuntu/main/install.sh | sudo bash
-...
-
+```
 
 Cổng khác: `curl -fsSL ... | sudo PORT=8080 bash`
 
