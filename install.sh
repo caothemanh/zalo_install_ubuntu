@@ -785,7 +785,16 @@ const setStatus = (status, extra = {}) => { try { writeJson(STATUS, { status, at
 const safe = (n) => String(n).replace(/[^\w.\-()\u00C0-\u1EF9 ]/g, "_").slice(0, 120);
 const KIND_EXT = { photo: ".jpg", animated_image: ".gif", video: ".mp4", audio: ".m4a", file: "" };
 
-export function attach(api, { onFatal } = {}) {
+function describe(e) {
+  try {
+    const o = e?.originalError ?? e;
+    if (typeof o === "string") return o.slice(0, 600);
+    return (JSON.stringify(o, Object.getOwnPropertyNames(o)) || String(o)).slice(0, 600);
+  } catch { return String(e).slice(0, 300); }
+}
+
+export function attach(api, { onFatal, onStatus } = {}) {
+  let errored = false;
   const me = String(api.getCurrentUserID());
   const userCache = new Map(), lastTry = new Map();
 
@@ -866,18 +875,22 @@ export function attach(api, { onFatal } = {}) {
     if (err) {
       const msg = String(err?.error || err?.message || err);
       console.error("listen error:", msg);
+      console.error("  chi tiết:", describe(err));
+      errored = true;
+      onStatus?.("Đã đăng nhập nhưng không nghe được tin: " + msg.slice(0, 160));
       const now = Date.now();
       errs = errs.filter((t) => now - t < 60000); errs.push(now);
       const hard = /not logged in|checkpoint|login|cookie|session/i.test(msg);
       if (hard || errs.length >= 5) onFatal?.(msg, hard);
       return;
     }
+    if (errored) { errored = false; onStatus?.("Online - đang sao lưu"); }
     try {
       if (ev.type === "message" || ev.type === "message_reply") await handleMessage(ev);
       else if (ev.type === "message_unsend") handleUnsend(ev);
     } catch (e) { console.error("fb handler error", e); }
   });
-  return { handleMessage, handleUnsend };
+  return { handleMessage, handleUnsend, errored: () => errored };
 }
 
 async function main() {
@@ -902,10 +915,14 @@ async function main() {
       setStatus("Lỗi đăng nhập: " + msg.slice(0, 200));
       process.exit(net.test(msg) ? 1 : 0); // lỗi cookie/checkpoint: không thử lại liên tục để tránh bị khóa
     }
-    attach(api, {
-      onFatal: (msg, hard) => { setStatus((hard ? "Cần đăng nhập lại: " : "Lỗi kết nối: ") + msg.slice(0, 200)); process.exit(hard ? 0 : 1); },
+    const uid = String(api.getCurrentUserID());
+    const h = attach(api, {
+      onFatal: (msg, hard) => { setStatus((hard ? "Cần đăng nhập lại: " : "Lỗi kết nối: ") + msg.slice(0, 200), { uid }); process.exit(hard ? 0 : 1); },
+      onStatus: (s) => setStatus(s, { uid }),
     });
-    setStatus("Online - đang sao lưu", { uid: String(api.getCurrentUserID()) });
+    setStatus("Đã đăng nhập, đang kết nối nghe tin...", { uid });
+    // Chỉ báo Online nếu sau 60 giây không có lỗi nghe tin
+    setTimeout(() => { if (!h.errored()) setStatus("Online - đang sao lưu", { uid }); }, 60000);
     console.log("Facebook: đã đăng nhập", api.getCurrentUserID());
     setInterval(() => { try { fs.writeFileSync(APPSTATE, JSON.stringify(api.getAppState()), { mode: 0o600 }); } catch {} }, 30 * 60 * 1000);
   });
